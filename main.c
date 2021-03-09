@@ -2,6 +2,8 @@
  * License: WTFPL
  * Copyleft 2019 DusteD
  */
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -9,6 +11,9 @@
 #include <inttypes.h>
 #include <getopt.h>
 #include <errno.h>
+#include <endian.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_net.h>
 #include "64.h"
@@ -134,6 +139,12 @@ typedef struct {
 	char ipStr[IP_ADDR_SIZE];
 	int sdl_init;
 	int sdl_net_init;
+	FILE *dfp;
+	char dmaFile[MAX_STRING_SIZE];
+	int dmaFileSize;
+	uint8_t *dmaAddress;
+	TCPsocket tcpSock;
+	SDLNet_SocketSet tcpSet;
 } programData;
 
 // I found the colors here: https://gist.github.com/funkatron/758033
@@ -237,133 +248,160 @@ static inline void pic(SDL_Texture* tex, int width, int height, int pitch, uint3
 	}
 }
 
-int sendSequence(programData *prgData, const uint8_t *data, int len)
+int openU64Socket(programData *data, int port)
 {
 	IPaddress ip;
-	TCPsocket sock;
-	uint8_t buf[TCP_BUFFER_SIZE];
-	SDLNet_SocketSet set;
-	set=SDLNet_AllocSocketSet(1);
-	int result = 0;
 
-	if(SDLNet_ResolveHost(&ip, prgData->hostName, TELNET_PORT)) {
-		fprintf(stderr, "Error resolving '%s' : %s\n", prgData->hostName, SDLNet_GetError());
-		SDLNet_FreeSocketSet(set);
+	data->tcpSet = SDLNet_AllocSocketSet(1);
+
+	if(SDLNet_ResolveHost(&ip, data->hostName, port)) {
+		fprintf(stderr, "Error resolving '%s' : %s\n", data->hostName, SDLNet_GetError());
+		SDLNet_FreeSocketSet(data->tcpSet);
 		return EXIT_FAILURE;
 	}
 
-	sock = SDLNet_TCP_Open(&ip);
-	if(!sock) {
-		fprintf(stderr, "Error connecting to '%s' : %s\n", prgData->hostName, SDLNet_GetError());
-		SDLNet_FreeSocketSet(set);
+	data->tcpSock = SDLNet_TCP_Open(&ip);
+	if(!data->tcpSock) {
+		fprintf(stderr, "Error connecting to '%s' : %s\n", data->hostName, SDLNet_GetError());
+		SDLNet_FreeSocketSet(data->tcpSet);
 		return EXIT_FAILURE;
 	}
 
-	SDLNet_TCP_AddSocket(set, sock);
-
-	SDL_Delay(COMMAND_DELAY);
-	for(int i=0; i < len; i++) {
-		SDL_Delay(1);
-
-		if (unlikely(prgData->verbose)) {
-			printf("sending: %02x\n", data[i]);
-		}
-
-		result = SDLNet_TCP_Send(sock, &data[i], sizeof(uint8_t));
-		if(result < sizeof(uint8_t)) {
-			fprintf(stderr, "Error sending command data: %s\n", SDLNet_GetError());
-			SDLNet_TCP_Close(sock);
-			SDLNet_FreeSocketSet(set);
-			return EXIT_FAILURE;
-		}
-		// Empty u64 send buffer
-		while( SDLNet_CheckSockets(set, SDLNET_TIMEOUT) == 1 ) {
-			result = SDLNet_TCP_Recv(sock, &buf, TCP_BUFFER_SIZE - 1);
-			buf[result]=0;
-		}
-	}
-
-	SDLNet_TCP_Close(sock);
-	SDLNet_FreeSocketSet(set);
+	SDLNet_TCP_AddSocket(data->tcpSet, data->tcpSock);
+	SDL_Delay(1);
 
 	return EXIT_SUCCESS;
 }
 
-int sendCommand(programData *prgData, const uint16_t *data, int len)
+void closeU64Socket(programData *data)
 {
-	IPaddress ip;
-	TCPsocket sock;
+	if (data->tcpSock) {
+		SDLNet_TCP_Close(data->tcpSock);
+	}
+	if (data->tcpSet) {
+		SDLNet_FreeSocketSet(data->tcpSet);
+	}
+}
+
+int sendSequence(programData *prgData, const uint8_t *data, int len, int prepare)
+{
 	uint8_t buf[TCP_BUFFER_SIZE];
-	SDLNet_SocketSet set;
-	set=SDLNet_AllocSocketSet(1);
 	int result = 0;
 
-	if(SDLNet_ResolveHost(&ip, prgData->hostName, COMMAND_PORT)) {
-		fprintf(stderr, "Error resolving '%s' : %s\n", prgData->hostName, SDLNet_GetError());
-		SDLNet_FreeSocketSet(set);
-		return EXIT_FAILURE;
+	if (prepare) {
+		if (openU64Socket(prgData, TELNET_PORT) != EXIT_SUCCESS) {
+			return EXIT_FAILURE;
+		}
 	}
-
-	sock = SDLNet_TCP_Open(&ip);
-	if(!sock) {
-		fprintf(stderr, "Error connecting to '%s' : %s\n", prgData->hostName, SDLNet_GetError());
-		SDLNet_FreeSocketSet(set);
-		return EXIT_FAILURE;
-	}
-
-	SDLNet_TCP_AddSocket(set, sock);
 
 	SDL_Delay(COMMAND_DELAY);
+
 	for(int i=0; i < len; i++) {
 		SDL_Delay(1);
 
+		if (unlikely(prgData->verbose)) {
+			printf("%02x ", data[i]);
+		}
+
+		result = SDLNet_TCP_Send(prgData->tcpSock, &data[i], sizeof(uint8_t));
+		if(result < sizeof(uint8_t)) {
+			fprintf(stderr, "Error sending command data: %s\n", SDLNet_GetError());
+			SDLNet_TCP_Close(prgData->tcpSock);
+			SDLNet_FreeSocketSet(prgData->tcpSet);
+			return EXIT_FAILURE;
+		}
+		// Empty u64 send buffer
+		while( SDLNet_CheckSockets(prgData->tcpSet, SDLNET_TIMEOUT) == 1 ) {
+			result = SDLNet_TCP_Recv(prgData->tcpSock, &buf, TCP_BUFFER_SIZE - 1);
+			buf[result]=0;
+		}
+	}
+
+	if (prepare) {
+		closeU64Socket(prgData);
+	}
+
+	return EXIT_SUCCESS;
+}
+
+int sendPacket(programData *prgData)
+{
+	int result = 0;
+
+	if (prgData->verbose) {
+		for (int i = 0; i < prgData->dmaFileSize; i++) {
+			printf("%02x ", prgData->dmaAddress[i]);
+		}
+	}
+
+	result = SDLNet_TCP_Send(prgData->tcpSock, prgData->dmaAddress, prgData->dmaFileSize);
+	if(result < prgData->dmaFileSize) {
+		fprintf(stderr, "Error sending command data: %s\n", SDLNet_GetError());
+		SDLNet_TCP_Close(prgData->tcpSock);
+		SDLNet_FreeSocketSet(prgData->tcpSet);
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
+}
+
+int sendCommand(programData *prgData, const uint16_t *data, int len, int prepare)
+{
+	int result = 0;
+
+	if (prepare) {
+		if (openU64Socket(prgData, COMMAND_PORT) != EXIT_SUCCESS) {
+			return EXIT_FAILURE;
+		}
+	}
+
+	SDL_Delay(COMMAND_DELAY);
+
+	for (int i = 0; i < len; i++) {
 		if (unlikely(prgData->verbose)) {
 			printf("sending: %04x\n", data[i]);
 		}
 
-		result = SDLNet_TCP_Send(sock, &data[i], sizeof(uint16_t));
-		if(result < sizeof(uint16_t)) {
+		result = SDLNet_TCP_Send(prgData->tcpSock, &data[i], len);
+		if(result < len) {
 			fprintf(stderr, "Error sending command data: %s\n", SDLNet_GetError());
-			SDLNet_TCP_Close(sock);
-			SDLNet_FreeSocketSet(set);
+			closeU64Socket(prgData);
 			return EXIT_FAILURE;
 		}
-		// Empty u64 send buffer
-		while( SDLNet_CheckSockets(set, SDLNET_TIMEOUT) == 1 ) {
-			result = SDLNet_TCP_Recv(sock, &buf, TCP_BUFFER_SIZE - 1);
-			buf[result]=0;
-		}
+		SDL_Delay(1);
 	}
 
-	SDLNet_TCP_Close(sock);
-	SDLNet_FreeSocketSet(set);
+	if (prepare) {
+		closeU64Socket(prgData);
+	}
 
 	return EXIT_SUCCESS;
 }
 
-int runCommand(programData *prgData, command cmd)
+int runCommand(programData *prgData, command cmd, int prepare)
 {
 	int result = 0;
 	const uint16_t *cmdData = NULL;
 	char *infoString = NULL;
 	int size = 0;
 
+	// data in little endian
 	const uint16_t startData[] = {
-		SOCKET_CMD_VICSTREAM_ON,
+		htole16(SOCKET_CMD_VICSTREAM_ON),
 		0x0000,
-		SOCKET_CMD_AUDIOSTREAM_ON,
+		htole16(SOCKET_CMD_AUDIOSTREAM_ON),
 		0x0000
 	};
 
 	const uint16_t stopData[] = {
-		SOCKET_CMD_VICSTREAM_OFF,
+		htole16(SOCKET_CMD_VICSTREAM_OFF),
 		0x0000,
-		SOCKET_CMD_AUDIOSTREAM_OFF,
+		htole16(SOCKET_CMD_AUDIOSTREAM_OFF),
 		0x0000
 	};
 
 	const uint16_t resetData[] = {
-		SOCKET_CMD_RESET,
+		htole16(SOCKET_CMD_RESET),
 		0x0000
 	};
 
@@ -391,12 +429,42 @@ int runCommand(programData *prgData, command cmd)
 
 	printf("Sending %s command to Ultimate64...\n", infoString);
 
-	result = sendCommand(prgData, cmdData, size);
+	result = sendCommand(prgData, cmdData, size, prepare);
 	if (result != EXIT_SUCCESS) {
 		return result;
 	}
 
 	printf("  * done.\n");
+	return EXIT_SUCCESS;
+}
+
+int sendFile(programData *data)
+{
+	// s.mysend(pack("<H", 0xFF02))
+	// s.mysend(pack("<H", len(bytes)))
+	// s.mysend(bytes)
+
+	uint16_t sendCmd[] = {
+		htole16(SOCKET_CMD_DMARUN),
+		htole16(data->dmaFileSize)
+	};
+
+	if (openU64Socket(data, COMMAND_PORT) != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+
+	// Send command and filesize
+	if (sendCommand(data, sendCmd, sizeof(sendCmd) / sizeof(sendCmd[0]), 0) != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+
+	// Send actual file
+	if (sendPacket(data) != EXIT_SUCCESS) {
+		return EXIT_FAILURE;
+	}
+
+	closeU64Socket(data);
+
 	return EXIT_SUCCESS;
 }
 
@@ -413,7 +481,7 @@ int powerOff(programData *prgData)
 	};
 
 	printf("Sending power-off sequence to Ultimate64...\n");
-	result = sendSequence(prgData, data, sizeof(data));
+	result = sendSequence(prgData, data, sizeof(data), 1);
 	if (result != EXIT_SUCCESS) {
 		return result;
 	}
@@ -473,6 +541,12 @@ void cleanUp(programData *data)
 	if (data->afp) {
 		fclose(data->afp);
 	}
+	if (data->dmaAddress) {
+		munmap(data->dmaAddress, data->dmaFileSize);
+	}
+	if (data->dfp) {
+		fclose(data->dfp);
+	}
 	if (data->pkg) {
 		SDLNet_FreePacket(data->pkg);
 	}
@@ -528,7 +602,7 @@ int setupStream(programData *data)
 	}
 
 	if(strlen(data->hostName) && data->startStreamOnStart) {
-		if (runCommand(data, CMD_START_STREAM) != EXIT_SUCCESS) {
+		if (runCommand(data, CMD_START_STREAM, 1) != EXIT_SUCCESS) {
 			cleanUp(data);
 			return EXIT_FAILURE;
 		}
@@ -615,6 +689,12 @@ int setupStream(programData *data)
 		fprintf(stderr, "Failed to lock texture for writing");
 	}
 
+	if (strlen(data->dmaFile)) {
+		if (sendFile(data) != EXIT_SUCCESS) {
+			return EXIT_FAILURE;
+		}
+	}
+
 	return EXIT_SUCCESS;
 }
 
@@ -651,11 +731,11 @@ void runStream(programData *data)
 						printf("Can only start/stop stream when started with -u, -U or -I.\n");
 					} else {
 						if(data->isStreaming) {
-							if (runCommand(data, CMD_STOP_STREAM) != EXIT_SUCCESS) {
+							if (runCommand(data, CMD_STOP_STREAM, 1) != EXIT_SUCCESS) {
 								run = 0;
 							}
 						} else {
-							if (runCommand(data, CMD_START_STREAM) != EXIT_SUCCESS) {
+							if (runCommand(data, CMD_START_STREAM, 1) != EXIT_SUCCESS) {
 								run = 0;
 							}
 						}
@@ -673,7 +753,7 @@ void runStream(programData *data)
 				break;
 				case SDLK_r:
 					if(strlen(data->hostName)) {
-						if (runCommand(data, CMD_RESET) != EXIT_SUCCESS) {
+						if (runCommand(data, CMD_RESET, 1) != EXIT_SUCCESS) {
 							run = 0;
 						}
 					} else {
@@ -795,10 +875,37 @@ void runStream(programData *data)
 	}
 
 	if(strlen(data->hostName) && data->stopStreamOnExit) {
-		runCommand(data, CMD_STOP_STREAM);
+		runCommand(data, CMD_STOP_STREAM, 1);
 	}
 
 	cleanUp(data);
+}
+
+int loadFile(programData *data)
+{
+	struct stat st;
+
+	data->dfp = fopen(data->dmaFile, "r");
+	if (!data->dfp) {
+		perror("Error");
+		return EXIT_FAILURE;
+	}
+
+	if (fstat(fileno(data->dfp), &st) != 0) {
+		perror("Error");
+		return EXIT_FAILURE;
+	}
+
+	data->dmaFileSize = (int)st.st_size;
+
+	data->dmaAddress = mmap(NULL, data->dmaFileSize, PROT_READ, MAP_SHARED, fileno(data->dfp), 0);
+	if (data->dmaAddress == MAP_FAILED) {
+		perror("Error");
+		fclose(data->dfp);
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
 }
 
 void printHelp(void)
@@ -818,7 +925,8 @@ void printHelp(void)
 			"       -u IP (default off)   Connect to Ultimate64 at IP and command it to start streaming Video and Audio.\n"
 			"       -U IP (default off)   Same as -u but don't stop the streaming when u64view exits.\n"
 			"       -I IP (default off)   Just know the IP, do nothing, so keys can be used for starting/stopping stream.\n"
-			"       -o FN (default off)   Output raw ARGB to FN.rgb and PCM to FN.pcm (20 MiB/s, you disk must keep up or packets are dropped).\n\n");
+			"       -o FN (default off)   Output raw ARGB to FN.rgb and PCM to FN.pcm (20 MiB/s, you disk must keep up or packets are dropped).\n"
+			"       -x FN                 load and run program\n\n");
 }
 
 int parseArguments(int argc, char **argv, programData *data)
@@ -828,7 +936,7 @@ int parseArguments(int argc, char **argv, programData *data)
 	char *endptr;
 
 	errno = 0;
-	while ((c = getopt (argc, argv, "hl:a:z:fsvVcmtT:u:U:I:o:")) != -1) {
+	while ((c = getopt (argc, argv, "hl:a:z:fsvVcmtT:u:U:I:o:x:")) != -1) {
 		switch(c) {
 			case 'l':
 				data->listen = (int)strtol(optarg, &endptr, 10);
@@ -936,9 +1044,16 @@ int parseArguments(int argc, char **argv, programData *data)
 				data->stopStreamOnExit=0;
 				data->startStreamOnStart=0;
 				break;
+			case 'x':
+				strncpy(data->dmaFile, optarg, MAX_STRING_SIZE - 1);
+				if (loadFile(data) != EXIT_SUCCESS)
+				{
+					return EXIT_FAILURE;
+				}
+				break;
 			case '?':
 				if (optopt == 'l' || optopt == 'a' || optopt == 'z' ||
-				    optopt == 'u' || optopt  == 'U' || optopt == 'I') {
+				    optopt == 'u' || optopt  == 'U' || optopt == 'I' || optopt == 'x') {
 					fprintf(stderr, "Option -%c requires an argument.\n", optopt);
 					return EXIT_FAILURE;
 				} else if (optopt == 'T') {
